@@ -16,6 +16,7 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -205,13 +206,18 @@ func login(c *gin.Context) {
 	service := c.Query("service")
 	tgc := GetTGC(c)
 	if tgc != nil {
+		fmt.Println("login: with TGC, user:", tgc.User)
 		localservice := getLocalURL(c) + "/login"
 		st := NewTicket("ST", service, tgc.User, false)
 		if service != "" && service != localservice {
-			service = service + "?ticket=" + st.Value
+			p := "?"
+			if strings.Contains(service, "?") {
+				p = "&"
+			}
+			service = service + p + "ticket=" + st.Value
+			c.Redirect(303, service)
 			return
 		}
-		service = localservice + "?ticket=" + st.Value
 	}
 
 	lt := NewTicket("LT", "", "", false)
@@ -266,7 +272,11 @@ func loginPost(c *gin.Context) {
 		fmt.Println("ok: Validateuser true")
 		st := NewTicket("ST", service, username, true)
 		NewTGC(c, st)
-		service = service + "?ticket=" + st.Value
+		p := "?"
+		if strings.Contains(service, "?") {
+			p = "&"
+		}
+		service = service + p + "ticket=" + st.Value //TODO manage ? or &
 	}
 	fmt.Println("Redirect to Service: " + service)
 	c.Redirect(303, service)

@@ -15,9 +15,21 @@ import (
 	"html/template"
 	"math/rand"
 	"net/http"
+	"net/url"
 	"os"
+	"regexp"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/gin-contrib/sessions"
+	"github.com/gin-contrib/sessions/cookie"
+
+	"github.com/itsjamie/gin-cors"
+
+	"github.com/ulule/limiter"
+	mgin "github.com/ulule/limiter/drivers/middleware/gin"
+	"github.com/ulule/limiter/drivers/store/memory"
 )
 
 const letterBytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -28,8 +40,8 @@ const (
 )
 
 var src = rand.NewSource(time.Now().UnixNano())
-var hashKey = []byte("very-secret")
-var blockKey = []byte("0123456789123456")
+var hashKey = []byte(config.HashSecret)
+var blockKey = []byte(config.Secret)
 var secure = securecookie.New(hashKey, blockKey)
 
 func RandString(n int) string {
@@ -80,9 +92,8 @@ func GetTicket(value string) *Ticket {
 	mutex.Unlock()
 	if ok {
 		return &t
-	} else {
-		return nil
 	}
+	return nil
 }
 
 func DeleteTicket(value string) {
@@ -94,18 +105,18 @@ func DeleteTicket(value string) {
 func NewTGC(ctx *gin.Context, ticket *Ticket) {
 	cookie := &http.Cookie{Name: cookieName, Path: *basePath}
 	tgt := NewTicket("TGT", ticket.Service, ticket.User, false)
-	encoded_value, _ := secure.Encode(cookieName, tgt.Value)
+	encodedValue, _ := secure.Encode(cookieName, tgt.Value)
 
-	fmt.Printf("New TGC User: <%s>\n", ticket.User)
-	cookie.Value = encoded_value
+	log.Debug(fmt.Sprintf("New TGC User: <%s>", ticket.User))
+	cookie.Value = encodedValue
 	http.SetCookie(ctx.Writer, cookie)
 }
 
 func GetTGC(ctx *gin.Context) *Ticket {
 	payload, _ := ctx.Cookie(cookieName)
-	var decoded_value string
-	secure.Decode(cookieName, payload, &decoded_value)
-	return GetTicket(decoded_value)
+	var decodedValue string
+	secure.Decode(cookieName, payload, &decodedValue)
+	return GetTicket(decodedValue)
 }
 
 func DeleteTGC(ctx *gin.Context) {
@@ -122,11 +133,21 @@ func DeleteTGC(ctx *gin.Context) {
 }
 
 var (
-	basePath                = flag.String("basepath", "", "basepath")
-	tickets                 = map[string]Ticket{}
-	cookieName              = "CASTGC"
-	mutex                   = &sync.Mutex{}
-	port                    = flag.String("port", "3004", "CAS listening port")
+	basePath   = flag.String("basepath", "", "basepath")
+	backend    = flag.String("backend", "test", "user validate : [test|ldap]")
+	tickets    = map[string]Ticket{}
+	cookieName = "CASTGC"
+	mutex      = &sync.Mutex{}
+	port       = flag.String("port", "3004", "CAS listening port")
+	debug      = flag.Bool("debug", false, "Debug, doesn't log to file")
+	conf       = flag.String("conf", "", "Optional INI config file")
+	config     = Config{
+		Port:       ":3004",
+		Secret:     "0123456789123456",
+		HashSecret: "very-secret",
+		LdapServer: "ldap.example.org",
+		LdapBind:   "ou=people,dc=example,dc=org",
+	}
 	garbageCollectionPeriod = 5
 )
 
@@ -152,26 +173,97 @@ func loadTemplates(list ...string) multitemplate.Render {
 	return r
 }
 
+func init() {
+	//if flag.Lookup("test.v") != nil {
+	if !strings.HasSuffix(os.Args[0], ".test") {
+		flag.Parse()
+	} else {
+		*debug = true
+	}
+
+	config, _ = readConf(config, *conf)
+	if *debug {
+		fmt.Printf("%+v\n", config)
+	}
+
+	confLog(config.LogPath)
+
+}
+
 func main() {
 	cr := cron.New()
 	cr.AddFunc(fmt.Sprintf("@every %dm", garbageCollectionPeriod), collectTickets)
 	cr.Start()
 
-	flag.Parse()
+	setupServer().Run(":" + *port)
 
-	r := gin.Default()
+	cr.Stop()
+}
+
+// The engine with all endpoints is now extracted from the main function
+func setupServer() *gin.Engine {
+
+	rate, err := limiter.NewRateFromFormatted("10-M") // 10 reqs/minute
+	if err != nil {
+		panic(err)
+	}
+	lStore := memory.NewStore()
+	middleware := mgin.NewMiddleware(limiter.New(lStore, rate))
+
+	r := gin.New() //Default()
+	if *debug == false {
+		r.Use(gin.LoggerWithFormatter(func(param gin.LogFormatterParams) string {
+			// custom format
+			return fmt.Sprintf("%s - [%s] \"%s %s %s\" %d \"%s\" %s\n",
+				param.ClientIP,
+				param.TimeStamp.Format(time.RFC3339),
+				param.Method,
+				param.Path,
+				param.Request.Proto,
+				param.StatusCode,
+				param.Request.UserAgent(),
+				param.ErrorMessage,
+			)
+		}))
+	} else {
+		r.Use(gin.Logger())
+	}
+	r.Use(gin.Recovery())
+	r.ForwardedByClientIP = true
+	r.Use(middleware)
+
+	/*  ========================================= */
+	r.Use(cors.Middleware(cors.Config{
+		Origins:         "*",
+		Methods:         "GET, POST",
+		RequestHeaders:  "Origin, Content-Type",
+		MaxAge:          50 * time.Second,
+		ValidateHeaders: false,
+	}))
+
+	store := cookie.NewStore(blockKey)
+	store.Options(sessions.Options{
+		//Domain:   "localhost",
+		SameSite: http.SameSiteStrictMode,
+	})
+	//store := memstore.NewStore([]byte("config.Secret"))
+	r.Use(sessions.Sessions("mysession", store))
+	/*  ========================================= */
 	r.Use(location.Default())
 
 	//r.LoadHTMLGlob("tmpl/*")
 	r.HTMLRender = loadTemplates("login.tmpl")
 	setApi(r)
-	r.Run(":" + *port)
 
-	cr.Stop()
+	log.Info("Server started")
+
+	//r.Run(":" + *port)
+
+	return r
 }
 
 func collectTickets() {
-	fmt.Printf("Cleaning tickets\n")
+	//fmt.Printf("Cleaning tickets\n")
 	numTicketsCollected := 0
 	m5, _ := time.ParseDuration(fmt.Sprintf("%dm", garbageCollectionPeriod))
 	five := time.Now().Add(-m5)
@@ -183,8 +275,10 @@ func collectTickets() {
 		}
 	}
 	mutex.Unlock()
-	fmt.Printf("%d tickets cleaned\n", numTicketsCollected)
-	//fmt.Printf(" Tickets : %+v\n", tickets)
+	if numTicketsCollected > 0 {
+		log.Info(fmt.Sprintf("%d tickets cleaned", numTicketsCollected))
+		//fmt.Printf(" Tickets : %+v\n", tickets)
+	}
 }
 
 func setApi(r *gin.Engine) {
@@ -196,6 +290,28 @@ func setApi(r *gin.Engine) {
 	// r.GET("/p3/serviceValidate", serviceValidateV3) // CASv3
 }
 
+func parseService(service string) (string, url.URL, url.Values) {
+	if service == "" {
+		return "", url.URL{}, nil
+	}
+	decodedValue, _ := url.QueryUnescape(service)
+	u, _ := url.Parse(decodedValue)
+	m, _ := url.ParseQuery(u.RawQuery)
+
+	s := fmt.Sprintf("%s://%s%s", u.Scheme, u.Host, u.Path)
+	q := url.Values{}
+	for v, e := range m {
+		if v != "ticket" {
+			q.Set(v, strings.Join(e, "\n"))
+		}
+	}
+	//query := q.Encode()
+	//query := strings.Replace(q.Encode(), "+", "%20", -1)
+	//query = strings.Replace(query, "%21", "!", -1)
+	location := url.URL{Scheme: u.Scheme, Host: u.Host, Path: u.Path}
+	return s, location, q
+}
+
 func getLocalURL(c *gin.Context) string {
 	url := location.Get(c)
 	return url.String()
@@ -203,17 +319,26 @@ func getLocalURL(c *gin.Context) string {
 
 func login(c *gin.Context) {
 	service := c.Query("service")
+	log.Debug(c.ClientIP(), " - GET /login")
 	tgc := GetTGC(c)
 	if tgc != nil {
+		log.Info(c.ClientIP(), " - TGC for: ", tgc.User)
 		localservice := getLocalURL(c) + "/login"
-		st := NewTicket("ST", service, tgc.User, false)
-		if service != "" && service != localservice {
-			service = service + "?ticket=" + st.Value
+		serv, l, q := parseService(service)
+		st := NewTicket("ST", serv, tgc.User, false)
+		if serv != "" && serv != localservice {
+			log.Debug("new service: ", serv)
+			q.Set("ticket", st.Value)
+			l.RawQuery = q.Encode()
+			log.Debug("Redirect to Service: " + l.String())
+			c.Redirect(302, l.String())
 			return
 		}
-		service = localservice + "?ticket=" + st.Value
+		//service = localservice + "?ticket=" + st.Value
+		//fmt.Println("new service 2: ", service)
 	}
 
+	log.Debug("no TGC")
 	lt := NewTicket("LT", "", "", false)
 	c.HTML(http.StatusOK, "login.tmpl", gin.H{
 		"title": "CAS Login",
@@ -221,62 +346,104 @@ func login(c *gin.Context) {
 	})
 }
 
-func validateUser(username, password string) bool {
-	fmt.Printf("- validateUser <%s> <%s>\n", username, password)
-
+func testValidateUser(username, password string) bool {
+	log.Debug(fmt.Sprintf("Validate test User <%s> <%s>", username, password))
 	if username == "" {
 		return false
 	}
-
 	if username != password {
 		return false
 	}
-
-	/*	if *domain != "" && !strings.Contains(username, *domain) {
-				username = username + "@" + *domain
-			}
-
-		    c, err := ldap.Dial(*ldapServer)
-			if err != nil {
-				fmt.Println(err)
-				return false
-			}
-			err = c.Bind(username, password)
-			if err != nil {
-				fmt.Println(err)
-				return false
-			}*/
 	return true
 }
 
 func loginPost(c *gin.Context) {
+	log.Debug(c.ClientIP(), " - POST /login")
+	session := sessions.Default(c)
+	var s Status
+	t := session.Get("status")
+	if t != nil {
+		s = StrToStatus(t.(string))
+	}
+	//fmt.Printf("=> count %+v\n", s.Count)
+	s = userFailLimiter(s, 30)
+
 	service := c.Query("service")
 	username := c.PostForm("username")
 	password := c.PostForm("password")
+
+	var IsGoodChar = regexp.MustCompile(`^[a-zA-Z0-9\.\@]+$`).MatchString
+	if IsGoodChar(username) == false {
+		log.Error("Bad Char in username")
+		username = ""
+	}
+	if len(username) > 64 {
+		log.Error("username too long")
+		username = ""
+	}
+	if len(password) > 256 {
+		log.Error("password too long")
+		password = ""
+	}
+
 	//lt := c.PostForm("lt") // TODO validate lt
 
-	if service == "" {
-		fmt.Println("pb: Missing service")
-		service = getLocalURL(c) + "/login"
+	switch {
+	case s.Lock == true:
+		session.Set("status", s.ToJSONStr())
+		session.Save()
+		c.Header("Content-Type", "text/html")
+		c.String(200, "<html>Too many errors, come back later</html>")
+		log.Debug(c.ClientIP(), " - Lock Status")
+	case username != "" && password != "":
+		valid := false
+		if *backend == "test" {
+			valid = testValidateUser(username, password)
+		}
+		if *backend == "ldap" {
+			valid = ldapValidateUser(username, password, config)
+		}
+		if valid == true {
+			s.User = username
+			s.Count = 0
+			s.Confirm = false
+			session.Set("status", s.ToJSONStr())
+			session.Save()
+
+			log.Info(c.ClientIP(), " - valid AUTHENTICATION [username:", username, "]")
+
+			serv, l, q := parseService(service)
+			st := NewTicket("ST", serv, username, true)
+			NewTGC(c, st)
+			if service != "" {
+				q.Set("ticket", st.Value)
+				l.RawQuery = q.Encode()
+				log.Debug("Post Redirect to Service: " + l.String())
+				c.Redirect(302, l.String())
+			} else {
+				log.Info("Auth without service")
+				c.Redirect(303, getLocalURL(c)+"/login")
+			}
+		} else {
+			log.Info(c.ClientIP(), " - AUTHENTICATION failed for ", username)
+			session.Set("status", s.ToJSONStr())
+			session.Save()
+			c.Header("Content-Type", "text/html")
+			c.String(200, "<html>bad user or pass</html>")
+		}
+	default:
+		log.Error(c.ClientIP(), " - Bad Post params")
+		c.Header("Content-Type", "text/html")
+		c.String(200, "<html>Error</html>")
+		//c.Redirect(303, getLocalURL(c) + "/login" )
 	}
-	if !validateUser(username, password) {
-		fmt.Println("pb: Validateuser false")
-		service = getLocalURL(c) + "/login"
-	} else {
-		fmt.Println("ok: Validateuser true")
-		st := NewTicket("ST", service, username, true)
-		NewTGC(c, st)
-		service = service + "?ticket=" + st.Value
-	}
-	fmt.Println("Redirect to Service: " + service)
-	c.Redirect(303, service)
 }
 
 func logout(c *gin.Context) {
-	fmt.Printf("Logout\n")
+	log.Debug("Logout")
 	tgc := GetTGC(c)
 	if tgc != nil {
-		fmt.Printf("Logout: DeleteTGC\n")
+		log.Info(c.ClientIP(), " - Logout: DeleteTGC for ", tgc.User)
 		DeleteTGC(c)
 		c.Writer.Write([]byte("User has been logged out"))
 	} else {
@@ -287,20 +454,25 @@ func logout(c *gin.Context) {
 func serviceValidate(c *gin.Context) {
 	service := c.Query("service")
 	ticket := c.Query("ticket")
+	serv, _, _ := parseService(service)
 
-	fmt.Printf("CASv2: serviceValidate <%s> <%s>\n", service, ticket)
+	log.Debug(fmt.Sprintf("CASv2: serviceValidate <%s> <%s>", service, ticket))
 	if ticket == "" {
-		c.Writer.Write(NewCASFailureResponse("INVALID_TICKET", "Ticket not recognized"))
+		log.Debug("INVALID_TICKET, empty ticket")
+		c.Writer.Write(NewCASFailureResponse("INVALID_TICKET", "Empty Ticket"))
 	} else {
 		t := GetTicket(ticket)
 		if t == nil {
+			log.Debug("INVALID_TICKET, Ticket not recognized")
 			c.Writer.Write(NewCASFailureResponse("INVALID_TICKET", "Ticket not recognized"))
 		} else {
-			if t.Service != service {
+			if t.Service != serv {
+				log.Debug("INVALID_SERVICE")
 				c.Writer.Write(NewCASFailureResponse("INVALID_SERVICE", "Ticket was used for another service than it was generated for"))
 			} else {
 				DeleteTicket(ticket)
-				fmt.Printf("=> User <%s>\n", t.User)
+				//fmt.Printf("=> User <%s>\n", t.User)
+				log.Info(c.ClientIP(), " - AUTHENTICATION_CASv2 [username:", t.User, "]")
 				c.Writer.Write(NewCASSuccessResponse(t.User))
 			}
 		}
@@ -311,7 +483,7 @@ func validate(c *gin.Context) {
 	service := c.Query("service")
 	ticket := c.Query("ticket")
 
-	fmt.Printf("CASv1: validate <%s> <%s>\n", service, ticket)
+	log.Debug(fmt.Sprintf("CASv1: validate <%s> <%s>\n", service, ticket))
 	if ticket == "" {
 		c.Writer.Write([]byte("no\n"))
 	} else {
@@ -323,7 +495,8 @@ func validate(c *gin.Context) {
 				c.Writer.Write([]byte("no\n"))
 			} else {
 				DeleteTicket(ticket)
-				fmt.Printf("=> User <%s>\n", t.User)
+				//fmt.Printf("=> User <%s>\n", t.User)
+				log.Info(c.ClientIP(), " - AUTHENTICATION_CASv1 [username:", t.User, "]")
 				c.Writer.Write([]byte("yes\n" + t.User + "\n"))
 			}
 		}

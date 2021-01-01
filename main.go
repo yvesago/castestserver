@@ -103,7 +103,11 @@ func DeleteTicket(value string) {
 }
 
 func NewTGC(ctx *gin.Context, ticket *Ticket) {
-	cookie := &http.Cookie{Name: cookieName, Path: *basePath}
+	sec := false
+	if *debug == false {
+		sec = true
+	}
+	cookie := &http.Cookie{Name: cookieName, Path: *basePath, HttpOnly: sec, Secure: sec}
 	tgt := NewTicket("TGT", ticket.Service, ticket.User, false)
 	encodedValue, _ := secure.Encode(cookieName, tgt.Value)
 
@@ -410,9 +414,9 @@ func loginPost(c *gin.Context) {
 			session.Set("status", s.ToJSONStr())
 			session.Save()
 
-			log.Info(c.ClientIP(), " - valid AUTHENTICATION [username:", username, "]")
 
 			serv, l, q := parseService(service)
+			log.Info(c.ClientIP(), " - AUTHENTICATION [username:", username, "] [service:", serv, "]")
 			st := NewTicket("ST", serv, username, true)
 			NewTGC(c, st)
 			if service != "" {
@@ -421,7 +425,7 @@ func loginPost(c *gin.Context) {
 				log.Debug("Post Redirect to Service: " + l.String())
 				c.Redirect(302, l.String())
 			} else {
-				log.Info("Auth without service")
+				log.Info(c.ClientIP(), " - auth without service")
 				c.Redirect(303, getLocalURL(c)+"/login")
 			}
 		} else {
@@ -472,7 +476,7 @@ func serviceValidate(c *gin.Context) {
 			} else {
 				DeleteTicket(ticket)
 				//fmt.Printf("=> User <%s>\n", t.User)
-				log.Info(c.ClientIP(), " - AUTHENTICATION_CASv2 [username:", t.User, "]")
+				log.Info(c.ClientIP(), " - ServiceValidate_CASv2 [username:", t.User, "] [service:", serv, "]")
 				c.Writer.Write(NewCASSuccessResponse(t.User))
 			}
 		}
@@ -482,6 +486,7 @@ func serviceValidate(c *gin.Context) {
 func validate(c *gin.Context) {
 	service := c.Query("service")
 	ticket := c.Query("ticket")
+	serv, _, _ := parseService(service)
 
 	log.Debug(fmt.Sprintf("CASv1: validate <%s> <%s>\n", service, ticket))
 	if ticket == "" {
@@ -491,12 +496,12 @@ func validate(c *gin.Context) {
 		if t == nil {
 			c.Writer.Write([]byte("no\n"))
 		} else {
-			if t.Service != service {
+			if t.Service != serv {
 				c.Writer.Write([]byte("no\n"))
 			} else {
 				DeleteTicket(ticket)
 				//fmt.Printf("=> User <%s>\n", t.User)
-				log.Info(c.ClientIP(), " - AUTHENTICATION_CASv1 [username:", t.User, "]")
+				log.Info(c.ClientIP(), " - ServiceValidate_CASv1 [username:", t.User, "] [service:", serv, "]")
 				c.Writer.Write([]byte("yes\n" + t.User + "\n"))
 			}
 		}

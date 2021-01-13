@@ -99,12 +99,15 @@ func confLog(path string) {
 
 // Config struct
 type Config struct {
-	Port       string
-	Secret     string
-	HashSecret string
-	LdapServer string
-	LdapBind   string
-	LogPath    string
+	Port           string
+	Secret         string
+	HashSecret     string
+	LdapServer     string
+	LdapBind       string
+	LogPath        string
+	TGCvalidPeriod int
+	AdmStatusRead  []string
+	AdmStatusDel   []string
 }
 
 func readConf(config Config, file string) (Config, error) {
@@ -113,4 +116,14 @@ func readConf(config Config, file string) (Config, error) {
 	}
 	ini.MapTo(&config, file)
 	return config, nil
+}
+
+func contains(s []string, str string) bool {
+	for _, v := range s {
+		if v == str {
+			return true
+		}
+	}
+
+	return false
 }

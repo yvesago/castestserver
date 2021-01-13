@@ -44,9 +44,22 @@ HashSecret=very-secret
 LdapServer=ldap-server.example.org
 LdapBind=ou=people,dc=example,dc=org
 LogPath=./log.log
+AdmStatusRead = secret1
+AdmStatusDel  = secret1, secret2
 
 
 $ ./castestserver -conf confsample.ini -backend ldap &
+
+
+```
+Access to admin webservice
+
+```bash
+# read sessions
+$ curl -H "SharedKey: secret1" http://localhost:3004/status
+
+# remove session for user1
+$ curl -H "SharedKey: secret2" http://localhost:3004/del/user1
 
 
 ```
@@ -86,6 +99,6 @@ $ GOOS=darwin GOARCH=amd64 go build  -ldflags "-s" -o castestserverOsX
 
 MIT License
 
-Copyright (c) 2020 Yves Agostini
+Copyright (c) 2021 Yves Agostini
 
 <yves+github@yvesago.net>

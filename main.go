@@ -18,6 +18,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -146,11 +147,12 @@ var (
 	debug      = flag.Bool("debug", false, "Debug, doesn't log to file")
 	conf       = flag.String("conf", "", "Optional INI config file")
 	config     = Config{
-		Port:       ":3004",
-		Secret:     "0123456789123456",
-		HashSecret: "very-secret",
-		LdapServer: "ldap.example.org",
-		LdapBind:   "ou=people,dc=example,dc=org",
+		Port:           ":3004",
+		Secret:         "0123456789123456",
+		HashSecret:     "very-secret",
+		LdapServer:     "ldap.example.org",
+		LdapBind:       "ou=people,dc=example,dc=org",
+		TGCvalidPeriod: 4, // hours
 	}
 	garbageCollectionPeriod = 5
 )
@@ -240,7 +242,7 @@ func setupServer() *gin.Engine {
 	r.Use(cors.Middleware(cors.Config{
 		Origins:         "*",
 		Methods:         "GET, POST",
-		RequestHeaders:  "Origin, Content-Type",
+		RequestHeaders:  "Origin, Content-Type, SharedKey",
 		MaxAge:          50 * time.Second,
 		ValidateHeaders: false,
 	}))
@@ -259,6 +261,8 @@ func setupServer() *gin.Engine {
 	r.HTMLRender = loadTemplates("login.tmpl")
 	setApi(r)
 
+	setAdmApi(r)
+
 	log.Info("Server started")
 
 	//r.Run(":" + *port)
@@ -271,9 +275,15 @@ func collectTickets() {
 	numTicketsCollected := 0
 	m5, _ := time.ParseDuration(fmt.Sprintf("%dm", garbageCollectionPeriod))
 	five := time.Now().Add(-m5)
+	tgcHours, _ := time.ParseDuration(fmt.Sprintf("%dh", config.TGCvalidPeriod))
+	tgcValid := time.Now().Add(-tgcHours)
 	mutex.Lock()
 	for k, v := range tickets {
-		if (v.Class == "ST") && v.CreatedAt.Before(five) {
+		if ((v.Class == "ST") || (v.Class == "LT")) && v.CreatedAt.Before(five) {
+			delete(tickets, k)
+			numTicketsCollected++
+		}
+		if (v.Class == "TGT") && v.CreatedAt.Before(tgcValid) {
 			delete(tickets, k)
 			numTicketsCollected++
 		}
@@ -292,6 +302,59 @@ func setApi(r *gin.Engine) {
 	r.GET("/validate", validate)               // CASv1
 	r.GET("/serviceValidate", serviceValidate) // CASv2
 	// r.GET("/p3/serviceValidate", serviceValidateV3) // CASv3
+}
+
+// curl -H "SharedKey: secret1" http://localhost:8001/status
+func readStatus(c *gin.Context) {
+	auth := c.Request.Header.Get("SharedKey")
+	//fmt.Println("header:", auth)
+	c.Header("Content-Type", "text/plain")
+	if auth != "" && contains(config.AdmStatusRead, c.Request.Header.Get("SharedKey")) == true {
+		var t []Ticket
+		for _, v := range tickets {
+			t = append(t, v)
+		}
+		sort.Slice(t, func(i1, i2 int) bool {
+			return t[i1].Class > t[i2].Class
+		})
+		h := ""
+		for _, v := range t {
+			h = h + fmt.Sprintf("%s [%s]: %s %s\n", v.Class, v.CreatedAt, v.User, v.Service)
+		}
+
+		c.String(200, h)
+	} else {
+		c.String(404, "access forbiden")
+	}
+
+}
+
+// curl -X POST -H "SharedKey: secret" http://localhost:8001/del/user1
+func delStatus(c *gin.Context) {
+	auth := c.Request.Header.Get("SharedKey")
+	//fmt.Println("header:", auth)
+	c.Header("Content-Type", "text/plain")
+	user := c.Param("login")
+	msg := "no ticket for user"
+	if auth != "" && user != "" && contains(config.AdmStatusRead, c.Request.Header.Get("SharedKey")) == true {
+		mutex.Lock()
+		for k, v := range tickets {
+			if v.User == user {
+				delete(tickets, k)
+				msg = ""
+			}
+		}
+		mutex.Unlock()
+		c.String(200, fmt.Sprintf("%s %s removed\n", msg, user))
+	} else {
+		c.String(404, "access forbiden")
+	}
+}
+
+func setAdmApi(r *gin.Engine) {
+	r.GET("/status", readStatus)
+	r.POST("/del/:login", delStatus)
+
 }
 
 func parseService(service string) (string, url.URL, url.Values) {
@@ -413,7 +476,6 @@ func loginPost(c *gin.Context) {
 			s.Confirm = false
 			session.Set("status", s.ToJSONStr())
 			session.Save()
-
 
 			serv, l, q := parseService(service)
 			log.Info(c.ClientIP(), " - AUTHENTICATION [username:", username, "] [service:", serv, "]")

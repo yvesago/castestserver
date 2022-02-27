@@ -99,6 +99,6 @@ $ GOOS=darwin GOARCH=amd64 go build  -ldflags "-s" -o castestserverOsX
 
 MIT License
 
-Copyright (c) 2021 Yves Agostini
+Copyright (c) 2022 Yves Agostini
 
 <yves+github@yvesago.net>
